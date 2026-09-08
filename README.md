@@ -55,6 +55,7 @@ usage_watch.py test            # synthetic CRITICAL, to verify alert delivery
 usage_watch.py calibrate       # re-derive thresholds from your own logs
 usage_watch.py sync --pct 25   # calibrate against the real plan meter
 usage_watch.py serve           # the live meter (already installed as an agent)
+usage_watch.py ack <id>        # dismiss a reminder
 usage_watch.py uninstall
 ```
 
@@ -134,6 +135,28 @@ nothing — which silently froze the meter's data for half an hour while the sta
 looking perfectly fresh, because `pace.txt` is written *before* the save. Every scanning
 verb also takes an advisory `flock`, falling back to the last persisted state rather than
 racing.
+
+## Reminders
+
+Config takes a `reminders` list for one-off nudges that survive reboots, delivered through
+the same notification path as alerts:
+
+```json
+"reminders": [{
+  "id": "post-boost-resync",
+  "at": "2026-09-14T10:00",
+  "repeat_hours": 24,
+  "done_when": "resync",
+  "title": "Re-calibrate the weekly budget",
+  "body": "Week so far: ${week} of ${budget} ({spent}%). Run: usage_watch.py sync --pct <N> --apply"
+}]
+```
+
+`body` interpolates `{week}`, `{budget}` and `{spent}` from live data, so the nudge arrives
+with your actual numbers. `done_when: "resync"` makes it **self-clearing** — it stops once a
+`sync` with `pct >= 5` has been recorded on or after `at`, rather than nagging forever.
+Dismiss one by hand with `usage_watch.py ack <id>`. Pending reminders also show at the
+bottom of `usage_watch.py status`.
 
 ## Status line
 

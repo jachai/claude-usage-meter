@@ -54,6 +54,9 @@ DEFAULTS = {
     "slack_webhook": "",
     "auto_stop_on_critical": False,   # DANGEROUS: SIGTERM the worst session. Off by default.
     "quiet_hours": [],            # e.g. [[1,7]] to mute NOTICE between 01:00-07:00 local
+    # One-off nudges. `done_when: "resync"` clears itself once a sync with pct>=5 has
+    # been recorded on or after `at`, so it stops nagging when the job is actually done.
+    "reminders": [],
 }
 TIERS = ["OK", "NOTICE", "HIGH", "CRITICAL"]
 AGENT_RE = re.compile(r"/subagents/agent-([0-9a-zA-Z]+)\.jsonl$")
@@ -662,6 +665,11 @@ def render(a, causes, remedies, c):
     sy = c.get("_sync_note")
     if sy:
         L.append("  " + sy)
+    for r in c.get("_pending_reminders") or []:
+        L.append("")
+        L.append(f"  REMINDER  {r.get('title', '')}")
+        for ln in (r.get("body", "") or "").splitlines():
+            L.append("    " + ln)
     return "\n".join(L)
 
 
@@ -735,6 +743,63 @@ def maybe_alert(state, a, c):
     return True, body
 
 
+# ---------------------------------------------------------------- reminders
+
+def reminder_satisfied(rem, st):
+    """Has the thing this reminder is nagging about actually happened?"""
+    if rem.get("done_when") != "resync":
+        return False
+    try:
+        at = datetime.datetime.strptime(rem["at"], "%Y-%m-%dT%H:%M").timestamp()
+    except Exception:
+        return False
+    for o in st.get("syncs", []):
+        if o.get("t", 0) >= at and (o.get("pct") or 0) >= 5:
+            return True
+    return False
+
+
+def check_reminders(st, c, a):
+    """Fire any due reminder. Repeats on its own interval until satisfied or acked."""
+    now = time.time()
+    fired_at = st.setdefault("reminders_fired", {})
+    done = st.setdefault("reminders_done", [])
+    out = []
+    for rem in c.get("reminders") or []:
+        rid = rem.get("id")
+        if not rid or rid in done:
+            continue
+        try:
+            at = datetime.datetime.strptime(rem["at"], "%Y-%m-%dT%H:%M").timestamp()
+        except Exception:
+            continue
+        if now < at:
+            continue
+        if reminder_satisfied(rem, st):
+            done.append(rid)
+            continue
+        out.append(rem)
+        gap = float(rem.get("repeat_hours", 24)) * 3600
+        if now - fired_at.get(rid, 0) < gap:
+            continue
+        fired_at[rid] = now
+        body = rem.get("body", "").format(
+            spent=f"{a['spent_frac']*100:.0f}", budget=f"{a['budget']:.0f}",
+            week=f"{a['week_spent']:.0f}")
+        text = (f"REMINDER  {rem.get('title', rid)}\n\n{body}\n\n"
+                f"  (repeats every {rem.get('repeat_hours', 24)}h until done; "
+                f"dismiss with: usage_watch.py ack {rid})")
+        try:
+            with open(os.path.join(DIR, "REMINDER.txt"), "w") as f:
+                f.write(text + "\n")
+            with open(LOG, "a") as f:
+                f.write(f"\n{'='*78}\n{datetime.datetime.now():%F %T}  {text}\n")
+        except OSError:
+            pass
+        notify(rem.get("title", "Reminder"), body[:220], "NOTICE", c)
+    return out
+
+
 # ---------------------------------------------------------------- verbs
 
 def cmd_once(args):
@@ -742,13 +807,16 @@ def cmd_once(args):
     st, scanned = refresh(c, timeout=20.0)
     n = 0 if not scanned else 1
     a = assess(st, c)
+    pending = check_reminders(st, c, a)
     fired, body = maybe_alert(st, a, c)
     meta = {"last_run": time.time(),
             "last_fast_hr": round(a["fast_hr"], 1),
             "last_slow_hr": round(a["slow_hr"], 1),
             "last_week": round(a["week_spent"], 1),
             "last_tier": st.get("last_tier", "OK"),
-            "last_alert_at": st.get("last_alert_at", 0)}
+            "last_alert_at": st.get("last_alert_at", 0),
+            "reminders_fired": st.get("reminders_fired", {}),
+            "reminders_done": st.get("reminders_done", [])}
     # one tiny line so the statusline never has to parse the 3MB state file
     try:
         with open(PACE, "w") as f:
@@ -758,6 +826,8 @@ def cmd_once(args):
     except OSError:
         pass
     save_meta(meta)
+    if pending and args.verbose:
+        print("pending reminders: " + ", ".join(r.get("id", "?") for r in pending))
     if args.verbose or fired:
         print(body or f"OK  +{n} calls  ${a['fast_hr']:.0f}/hr now  ${a['slow_hr']:.0f}/hr sustained  "
                       f"week ${a['week_spent']:.0f}/${a['budget']:.0f}")
@@ -768,6 +838,11 @@ def cmd_status(args):
     c = cfg()
     st, _ = refresh(c)
     a = assess(st, c)
+    c["_pending_reminders"] = [
+        r for r in (c.get("reminders") or [])
+        if r.get("id") not in st.get("reminders_done", [])
+        and r.get("at", "9999") <= datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
+        and not reminder_satisfied(r, st)]
     causes, remedies = diagnose(a, c)
     if not remedies:
         remedies = ["Nothing to do - pace is normal."]
@@ -1433,6 +1508,20 @@ def cmd_serve(args):
     return 0
 
 
+def cmd_ack(args):
+    st = load(STATE, {})
+    done = st.setdefault("reminders_done", [])
+    if args.id not in done:
+        done.append(args.id)
+    save_meta({"reminders_done": done})
+    try:
+        os.remove(os.path.join(DIR, "REMINDER.txt"))
+    except OSError:
+        pass
+    print(f"dismissed: {args.id}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
@@ -1452,6 +1541,9 @@ def main():
     v = sub.add_parser("serve")
     v.add_argument("--port", type=int, default=7654)
     v.set_defaults(f=cmd_serve)
+    ak = sub.add_parser("ack")
+    ak.add_argument("id")
+    ak.set_defaults(f=cmd_ack)
     k = sub.add_parser("calibrate"); k.add_argument("--days", type=int, default=50); k.set_defaults(f=cmd_calibrate)
     a = ap.parse_args()
     if not getattr(a, "f", None):
