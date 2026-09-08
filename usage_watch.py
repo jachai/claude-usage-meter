@@ -406,6 +406,24 @@ def procs():
     return out.splitlines()
 
 
+def scheduled_claude(plines):
+    """Claude processes that look scheduled rather than interactive: adopted by launchd
+    (ppid 1) or invoked non-interactively with -p. These run unattended, which is exactly
+    when spend goes unnoticed."""
+    out = []
+    for ln in plines:
+        f = ln.split(None, 3)
+        if len(f) < 4 or "usage_watch" in ln:
+            continue
+        pid, ppid, cmd = f[0], f[1], f[3]
+        argv0 = cmd.split()[0] if cmd.split() else ""
+        if os.path.basename(argv0) != "claude":
+            continue
+        if ppid == "1" or " -p " in cmd:
+            out.append(pid)
+    return out
+
+
 def find_pid(sid, plines):
     """Direct hit: the session id appears in the process command line."""
     for ln in plines:
@@ -422,7 +440,7 @@ def transcript(sid):
 
 
 def project_cwd(proj):
-    """'-Users-jachai-Dev-tetra-hub-cloud-api' -> '/Users/jachai/Dev/tetra/hub_cloud_api'.
+    """'-Users-you-Dev-acme-web-api' -> '/Users/you/Dev/acme/web_api'.
 
     The encoding is lossy (both '/' and '-' become '-'), so verify against live cwds
     rather than trusting the decode."""
@@ -555,9 +573,14 @@ def diagnose(a, c):
         remedies.append(f"Model: {top['m']} at ${top['c']:.0f}/{fw}m. Opus is 5x Sonnet on input. "
                         "Move mechanical chunks (test runs, mass edits, greps, rebases) to Sonnet; "
                         "keep Opus for design and review.")
-    if "monitoring" in (top["p"] or "") or any("proposal-monitor" in l for l in plines):
-        remedies.append("The launchd proposal-monitor is running (historically ~55% of your weekly drain). "
-                        "Pause it: `launchctl bootout gui/$(id -u)/com.tetra.proposal-monitor`")
+    sched = scheduled_claude(plines)
+    if sched:
+        remedies.append(
+            f"{len(sched)} Claude process(es) look scheduled or headless (pid "
+            f"{', '.join(sched[:3])}). A repeating timer job runs whether or not anyone is "
+            "watching, and can quietly become the single largest line item on the bill. "
+            "List them with `launchctl list | grep -i claude`, then pause one with "
+            "`launchctl bootout gui/$(id -u)/<label>`.")
     if not remedies and a["tier"] != "OK":
         remedies.append(f"No single structural cause stands out - the spend is spread across "
                         f"{len(per)} sessions. Close what you are not watching, and check `/usage`.")
@@ -771,7 +794,7 @@ def cmd_test(args):
     fake = {"now": time.time(), "fast_hr": 1896, "slow_hr": 812, "fast_c": 316, "slow_c": 812,
             "fast_per": {"7bce2fe9-test": {"c": 316.0, "n": 420, "s": 190, "g": 300, "cr": 90_000_000,
                                            "o": 30000, "x": 775_000, "m": "claude-opus-5",
-                                           "p": "-Users-jachai-Dev-tetra-hub-cloud-api",
+                                           "p": "-Users-you-Dev-acme-web-api",
                                            "first": time.time()/60 - 500, "last": time.time()/60}},
             "slow_per": {}, "week_spent": 11200, "budget": c["weekly_budget"], "spent_frac": 1.24,
             "elapsed_frac": 0.42, "pace": 2.95, "t_fast": "CRITICAL", "t_slow": "CRITICAL",
